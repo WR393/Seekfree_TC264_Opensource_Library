@@ -13,6 +13,10 @@ Thumbs.db
 .codex/
 .cursor/
 .settings/
+.agents/
+.trellis/
+AGENTS.md
+CLAUDE.md
 
 # Optional local caches
 *.log
