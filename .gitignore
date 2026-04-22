@@ -1,0 +1,18 @@
+# Build outputs
+Debug/
+Release/
+
+# ADS / Eclipse generated files
+*.launch
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Trellis / agent local state
+.codex/
+.cursor/
+.settings/
+
+# Optional local caches
+*.log
