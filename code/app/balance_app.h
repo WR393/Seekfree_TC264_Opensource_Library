@@ -1,8 +1,8 @@
 /*
  * balance_app.h
  *
- *  Created on: 2026
- *  Description: Single-track bike cascaded balance controller.
+ * 单轨车平衡控制：
+ * 转向环 -> 角度环 -> 角速度环 -> 舵机输出
  */
 
 #ifndef CODE_APP_BALANCE_APP_H_
@@ -28,7 +28,11 @@ void balance_gyro_loop(void);
 void balance_set_servo_trim(int32 trim);
 int32 balance_get_servo_trim(void);
 void balance_apply_servo_center(void);
+
+// 开启或关闭整套平衡控制。
 void balance_set_enabled(uint8 enabled);
+
+// 把当前 yaw 记录成目标航向。
 void balance_capture_heading_target(void);
 
 #endif /* CODE_APP_BALANCE_APP_H_ */

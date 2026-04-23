@@ -1,9 +1,12 @@
 /*
- * imu.c
+ * imu_app.c
  *
- *  Created on: 2025年4月22日
- *      Author:
+ * IMU 应用层：
+ * 1. 初始化 IMU660RC
+ * 2. 上电时把 yaw 归零
+ * 3. 把驱动层数据转换成全局姿态角和角速度
  */
+
 #include "imu_app.h"
 
 float roll = 0;
@@ -11,55 +14,46 @@ float pitch = 0;
 float yaw = 0;
 float gyro_x_rate = 0;
 float gyro_y_rate = 0;
+
+// 上电瞬间的 yaw 被视为 0 度航向。
 static float yaw_offset = 0;
 
 void usart_send(float roll, float pitch, float yaw, uint8_t fusion_sta)
 {
-    uint8_t buffer[15];  // 数据帧缓冲区
-    uint8_t sumcheck = 0; // 校验和变量
-    uint8_t addcheck = 0; // 附加校验变量
-    uint8_t index = 0;    // 缓冲区索引
+    uint8_t buffer[15];
+    uint8_t sumcheck = 0;
+    uint8_t addcheck = 0;
+    uint8_t index = 0;
 
-    // 将欧拉角转换为 int16，并放大100倍
+    // 上位机协议里，欧拉角需要先放大 100 倍再转成 int16。
     int16_t roll_int = (int16_t)(roll * 100.0f);
     int16_t pitch_int = (int16_t)(pitch * 100.0f);
     int16_t yaw_int = (int16_t)(yaw * 100.0f);
 
-    // 帧头 (0xAB)
     buffer[index++] = 0xAB;
-    // 源地址 (假设为 0xDC, 匿名飞控的默认地址)
     buffer[index++] = 0xDC;
-    // 目标地址 (0xFE, 上位机地址)
     buffer[index++] = 0xFE;
-    // 功能码 (ID: 0x03 表示飞控姿态：欧拉角格式)
     buffer[index++] = 0x03;
-    // 数据长度 (7字节数据)
     buffer[index++] = 7;
-    buffer[index++] = 0;  // 数据长度高字节为0
+    buffer[index++] = 0;
 
-    // 欧拉角数据 (int16, 角度扩大100倍)
     buffer[index++] = (uint8_t)(roll_int & 0xFF);
     buffer[index++] = (uint8_t)((roll_int >> 8) & 0xFF);
     buffer[index++] = (uint8_t)(pitch_int & 0xFF);
     buffer[index++] = (uint8_t)((pitch_int >> 8) & 0xFF);
     buffer[index++] = (uint8_t)(yaw_int & 0xFF);
     buffer[index++] = (uint8_t)((yaw_int >> 8) & 0xFF);
-
-    // 融合状态 (uint8)
     buffer[index++] = fusion_sta;
 
-    // 计算校验和和附加校验 (从帧头开始到DATA区结束)
     for (int i = 0; i < index; i++)
     {
         sumcheck += buffer[i];
         addcheck += sumcheck;
     }
 
-    // 添加校验和和附加校验值
     buffer[index++] = sumcheck;
     buffer[index++] = addcheck;
 
-    // 发送数据帧
     for (int i = 0; i < index; i++)
     {
         printf("%c", buffer[i]);
@@ -68,32 +62,46 @@ void usart_send(float roll, float pitch, float yaw, uint8_t fusion_sta)
 
 void imu_all_init(void)
 {
-    while(imu660rc_init(IMU660RC_QUARTERNION_480HZ))
+    // 初始化失败就一直重试，直到 IMU 正常工作。
+    while (imu660rc_init(IMU660RC_QUARTERNION_480HZ))
     {
-        // 初始化失败重试
         system_delay_ms(100);
     }
-    system_delay_ms(800);       // 等待IMU660RC零飘处理
-    yaw_offset = imu660rc_yaw;  // 记录开机初始yaw，用于归零
-    imu_proc();                 // 处理一次数据，更新全局变量
 
+    // 给 IMU 一点上电稳定时间。
+    system_delay_ms(800);
+
+    // 记录开机时的朝向，后面项目里把它当成 yaw = 0。
+    yaw_offset = imu660rc_yaw;
+    imu_proc();
 }
 
 void imu_proc(void)
 {
+    // 从驱动层取出姿态角。
     pitch = imu660rc_pitch;
-    roll  = imu660rc_roll;
-    yaw   = imu660rc_yaw - yaw_offset;
-    gyro_x_rate  = imu660rc_gyro_transition(imu660rc_gyro_x);
-    gyro_y_rate  = imu660rc_gyro_transition(imu660rc_gyro_y);
+    roll = imu660rc_roll;
 
-    if (yaw > 180)  yaw -= 360;
-    if (yaw < -180) yaw += 360;
+    // 绝对 yaw -> 相对开机时刻的 yaw。
+    yaw = imu660rc_yaw - yaw_offset;
+
+    // 原始陀螺数据 -> 角速度 deg/s。
+    gyro_x_rate = imu660rc_gyro_transition(imu660rc_gyro_x);
+    gyro_y_rate = imu660rc_gyro_transition(imu660rc_gyro_y);
+
+    // 把 yaw 约束到 [-180, 180]，方便做航向控制。
+    if (yaw > 180)
+    {
+        yaw -= 360;
+    }
+    if (yaw < -180)
+    {
+        yaw += 360;
+    }
 }
 
-/* 上位机测试 */
 void imu_test(void)
 {
-//    usart_send(roll, pitch, yaw, 1);
-    printf("%f,%f,%f\r\n",roll,pitch,yaw);
+    // 最简单的 IMU 连通性测试打印。
+    printf("%f,%f,%f\r\n", roll, pitch, yaw);
 }

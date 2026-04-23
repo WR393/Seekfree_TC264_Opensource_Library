@@ -1,27 +1,32 @@
 /*
  * servo_app.c
  *
- *  Created on: 2025年11月11日
- *      Author:
+ * 转向舵机控制封装。
  */
 
 #include "servo_app.h"
 
-/* 舵机占空比设置 */
 void servo_set(uint32_t duty)
 {
-    if(duty <= l_max)
+    // 限制在已经测试过的左右极限内，保护机械结构。
+    if (duty <= l_max)
+    {
         duty = l_max;
-    if(duty >= r_max)
+    }
+    if (duty >= r_max)
+    {
         duty = r_max;
-    pwm_set_duty(ATOM1_CH1_P33_9, duty); // ATOM1_CH1_P33_9 非固定引脚
+    }
+
+    pwm_set_duty(ATOM1_CH1_P33_9, duty);
 }
 
-/* 舵机测试 用于寻找中值*/
 void servo_test(void)
 {
+    // 慢速来回摆动，用于找左极限 / 中位 / 右极限。
     static uint16_t servo_motor_duty = mid;
     static uint8_t servo_motor_dir = 0;
+
     if (servo_motor_dir)
     {
         servo_motor_duty += 10;
@@ -38,6 +43,6 @@ void servo_test(void)
             servo_motor_dir = 0x01;
         }
     }
+
     servo_set(servo_motor_duty);
-//    printf("duty:%d\r\n",servo_motor_duty);
 }
