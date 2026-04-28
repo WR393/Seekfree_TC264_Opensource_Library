@@ -1,44 +1,42 @@
 #include "balance_app.h"
 
-// 舵机方向符号。
-// 如果车身向一侧倾倒时舵机纠偏方向反了，先检查这里。
-#define BALANCE_SERVO_SIGN (-1.0f)
+// 航向目标每次最多平滑移动的角度，单位：deg。
+// 只用于慢速方向环，避免目标航向突变直接传到平衡目标角。
+#define HEADING_STEP (1.5f)
 
-// 舵机机械回正后对应的软件中位补偿。
-// 小车前轮“视觉上走直线”的位置，未必正好等于舵机 PWM 的理论中值。
-#define BALANCE_SERVO_DEFAULT_TRIM (-950)
+// 调试开关：置 1 时关闭航向保持，只验证角度环和角速度环。
+#define BALANCE_DEBUG_DISABLE_HEADING (1)
 
-// 车身角度零点补偿。
-// 一开始先保持 0，只有在舵机中位已经调准后，才考虑动这里。
-#define BALANCE_ANGLE_BIAS_DEG (0.0f)
+// 接近直立且角速度很小时清掉角度环历史项，减少静止附近误差残留。
+#define BALANCE_UPRIGHT_DEADBAND_DEG (0.3f)
+#define BALANCE_GYRO_DEADBAND_DPS (3.0f)
 
-// 方向约束环只给一个很小的目标倾角。
-// 它的作用是限制持续偏航，强度必须明显弱于平衡环。
-#define BALANCE_STEERING_KP (0.20f)
-#define BALANCE_STEERING_LIMIT_DEG (4.0f)
-#define BALANCE_HEADING_ERROR_LIMIT_DEG (20.0f)
-#define BALANCE_HEADING_DEADBAND_DEG (1.5f)
+// 上电零点采样条件：需要连续采到足够多的稳定姿态样本。
+#define BALANCE_ZERO_SAMPLE_COUNT (100U)
+#define BALANCE_ZERO_MAX_ATTEMPT_COUNT (2000U)
+#define BALANCE_ZERO_MAX_GYRO_DPS (5.0f)
+#define BALANCE_ZERO_MAX_PITCH_DEG (8.0f)
 
-// 串级 PID 结构：
-// 转向环 -> target_angle
-// 角度环 -> target_gyro_rate
-// 角速度环 -> servo_output
+// 三级串级控制器：
+// steering_pid：航向误差 -> 目标车身倾角
+// angle_pid：车身倾角误差 -> 目标 pitch 角速度
+// gyro_pid：pitch 角速度误差 -> 舵机 PWM 修正量
 PID_T steering_pid;
 PID_T angle_pid;
 PID_T gyro_pid;
 
-// 调试和观测用的中间量。
+// 平衡控制链路的关键观测量，供串口日志和屏幕任务读取。
+float balance_zero_angle = -1.4f;
+float pitch_balance = 0.0f;
+float target_yaw = 0.0f;
+float target_yaw_smooth = 0.0f;
 float target_angle = 0.0f;
 float target_gyro_rate = 0.0f;
 float servo_output = 0.0f;
-float balance_heading_target_yaw = 0.0f;
-uint8 balance_control_enabled = 0;
 
-// 运行时舵机中位，可通过板载按键调整，不必重新编译。
-static int32 balance_servo_trim = BALANCE_SERVO_DEFAULT_TRIM;
-
-static float balance_wrap_angle(float angle)
+static float balance_normalize_angle(float angle)
 {
+    // 航向角按 [-180, 180] 归一化，避免跨 0/360 度时误差突跳。
     while (angle > 180.0f)
     {
         angle -= 360.0f;
@@ -52,137 +50,168 @@ static float balance_wrap_angle(float angle)
     return angle;
 }
 
-static float balance_limit(float value, float min_value, float max_value)
-{
-    if (value < min_value)
-    {
-        return min_value;
-    }
-
-    if (value > max_value)
-    {
-        return max_value;
-    }
-
-    return value;
-}
-
 void balance_init(void)
 {
-    // 最外层：方向保持环，只做慢速纠偏。
-    pid_init(&steering_pid, BALANCE_STEERING_KP, 0.0f, 0.0f, 0.0f, BALANCE_STEERING_LIMIT_DEG);
+    float zero_sum = 0.0f;
+    uint16 sample_count = 0U;
+    uint16 attempt_count = 0U;
 
-    // 中间层：角度环，把车身倾角误差变成目标角速度。
-    pid_init(&angle_pid, 10.0f, 0.0f, 0.0f, 0.0f, 200.0f);
-
-    // 最内层：角速度环，直接输出舵机控制量。
-    pid_init(&gyro_pid, 7.0f, 0.0f, 0.0f, 0.0f, 1300.0f);
+    // PID 输出限幅直接对应下一级目标或舵机修正量，调参时先确认执行周期。
+    pid_init(&steering_pid, 0.2f, 0.0f, 0.2f, 0.0f, 15.0f);
+    pid_init(&angle_pid, 10.0f, 0.0f, 0.0f, 0.0f, 300.0f);
+    pid_init(&gyro_pid, 1.1f, 0.0f, 0.0f, 0.0f, 650.0f);
     pid_app_limit_integral(&angle_pid, -200.0f, 200.0f);
 
-    target_angle = 0.0f;
-    target_gyro_rate = 0.0f;
-    servo_output = 0.0f;
-    balance_heading_target_yaw = 0.0f;
-    balance_control_enabled = 0;
-    balance_apply_servo_center();
-}
+    servo_set(mid);
+    motor_set_duty(0);
 
-void balance_set_enabled(uint8 enabled)
-{
-    // 每次开关平衡控制时都清掉 PID 历史项，
-    // 否则启动阶段会带着上一次的误差继续算。
-    pid_reset(&steering_pid);
-    pid_reset(&angle_pid);
-    pid_reset(&gyro_pid);
-
-    target_angle = 0.0f;
-    target_gyro_rate = 0.0f;
-    servo_output = 0.0f;
-    balance_control_enabled = enabled;
-
-    if (enabled)
+    // 静止上电时估计 pitch 零点；样本不稳定就重新累计。
+    while ((sample_count < BALANCE_ZERO_SAMPLE_COUNT) &&
+           (attempt_count < BALANCE_ZERO_MAX_ATTEMPT_COUNT))
     {
-        // 平衡接管时，把当前航向记成目标航向。
-        balance_capture_heading_target();
+        attempt_count++;
+        imu660rc_callback();
+        imu_proc();
+
+        if ((pitch > -BALANCE_ZERO_MAX_PITCH_DEG) &&
+            (pitch < BALANCE_ZERO_MAX_PITCH_DEG) &&
+            (gyro_y_rate > -BALANCE_ZERO_MAX_GYRO_DPS) &&
+            (gyro_y_rate < BALANCE_ZERO_MAX_GYRO_DPS))
+        {
+            zero_sum += pitch;
+            sample_count++;
+        }
+        else
+        {
+            zero_sum = 0.0f;
+            sample_count = 0U;
+        }
+
+        system_delay_ms(2);
+    }
+
+    if (sample_count >= BALANCE_ZERO_SAMPLE_COUNT)
+    {
+        // 正常情况使用稳定样本平均值作为机械安装零点。
+        balance_zero_angle = zero_sum / (float)BALANCE_ZERO_SAMPLE_COUNT;
     }
     else
     {
-        // 关闭平衡时，只保持舵机回到软件中位。
-        balance_apply_servo_center();
+        // 超时后退化为当前姿态，保证初始化不会永久卡住。
+        balance_zero_angle = pitch;
     }
-}
 
-void balance_capture_heading_target(void)
-{
-    balance_heading_target_yaw = yaw;
+    // 初始化结束时清掉控制历史，确保 PIT 第一次进入时从干净状态起算。
+    pitch_balance = 0.0f;
+    target_yaw = yaw;
+    target_yaw_smooth = yaw;
+    target_angle = 0.0f;
+    target_gyro_rate = 0.0f;
+    servo_output = 0.0f;
     pid_reset(&steering_pid);
+    pid_reset(&angle_pid);
+    pid_reset(&gyro_pid);
+    servo_set(mid);
 }
 
-void balance_steering_loop(float steering_error)
+void balance_steering_loop(void)
 {
-    float heading_error = 0.0f;
+    // 20ms 慢速外环：只负责方向保持，不直接驱动舵机。
+#if BALANCE_DEBUG_DISABLE_HEADING
+    target_angle = 0.0f;
+#else
+    float target_yaw_error = balance_normalize_angle(target_yaw - target_yaw_smooth);
+    float yaw_error = 0.0f;
 
-    if (!balance_control_enabled)
+    if (target_yaw_error > HEADING_STEP)
     {
-        target_angle = 0.0f;
-        return;
+        // 目标航向分步逼近，限制外环给角度环的扰动。
+        target_yaw_smooth = balance_normalize_angle(target_yaw_smooth + HEADING_STEP);
+    }
+    else if (target_yaw_error < -HEADING_STEP)
+    {
+        target_yaw_smooth = balance_normalize_angle(target_yaw_smooth - HEADING_STEP);
+    }
+    else
+    {
+        target_yaw_smooth = target_yaw;
     }
 
-    // 航向保持故意做得很弱。
-    // 它的目标是防止持续越跑越偏，不是替代平衡控制。
-    heading_error = balance_wrap_angle(balance_heading_target_yaw - yaw);
-    heading_error = balance_limit(heading_error,
-                                  -BALANCE_HEADING_ERROR_LIMIT_DEG,
-                                  BALANCE_HEADING_ERROR_LIMIT_DEG);
-
-    if ((heading_error < BALANCE_HEADING_DEADBAND_DEG) &&
-        (heading_error > -BALANCE_HEADING_DEADBAND_DEG))
-    {
-        heading_error = 0.0f;
-    }
-
-    target_angle = pid_calculate_positional(&steering_pid, heading_error + steering_error);
+    yaw_error = balance_normalize_angle(yaw - target_yaw_smooth);
+    target_angle = pid_calculate_by_error(&steering_pid, yaw_error);
+#endif
 }
 
 void balance_angle_loop(void)
 {
-    if (!balance_control_enabled)
+    // 10ms 中间环：用相对零点的 pitch 计算目标角速度。
+    pitch_balance = pitch - balance_zero_angle;
+    pid_set_target(&angle_pid, target_angle);
+
+    if ((pitch_balance > -BALANCE_UPRIGHT_DEADBAND_DEG) &&
+        (pitch_balance < BALANCE_UPRIGHT_DEADBAND_DEG) &&
+        (gyro_y_rate > -BALANCE_GYRO_DEADBAND_DPS) &&
+        (gyro_y_rate < BALANCE_GYRO_DEADBAND_DPS))
     {
-        target_gyro_rate = 0.0f;
-        return;
+        pid_reset(&angle_pid);
     }
 
-    // 车身倾角误差 -> 目标角速度。
-    pid_set_target(&angle_pid, target_angle + BALANCE_ANGLE_BIAS_DEG);
-    target_gyro_rate = pid_calculate_positional(&angle_pid, pitch);
+    target_gyro_rate = pid_calculate_positional(&angle_pid, pitch_balance);
+
+    // 角度环积分限幅在运行中重复约束，防止参数调试时积分边界漂移。
+    pid_app_limit_integral(&angle_pid, -200.0f, 200.0f);
 }
 
 void balance_gyro_loop(void)
 {
-    if (!balance_control_enabled)
-    {
-        servo_output = 0.0f;
-        balance_apply_servo_center();
-        return;
-    }
+    int32 servo_duty = 0;
 
-    // 快速内环直接驱动舵机。
+    // 2ms 内环：用 pitch 角速度闭环直接生成舵机 PWM 修正量。
     pid_set_target(&gyro_pid, target_gyro_rate);
     servo_output = pid_calculate_positional(&gyro_pid, gyro_y_rate);
-    servo_set((uint32_t)(mid + balance_servo_trim + (int32_t)(BALANCE_SERVO_SIGN * servo_output)));
+    servo_duty = (int32)mid + (int32)servo_output;
+    if (servo_duty < 0)
+    {
+        servo_duty = 0;
+    }
+    servo_set((uint32_t)servo_duty);
 }
 
-void balance_set_servo_trim(int32 trim)
+void pid_test(void)
 {
-    balance_servo_trim = trim;
-}
+    // 前台低优先级日志任务，100ms 打印一次，不放在 2ms/10ms 中断里。
+    static uint32 last_print_tick = 0U;
+    static uint8 header_printed = 0U;
 
-int32 balance_get_servo_trim(void)
-{
-    return balance_servo_trim;
-}
+    if ((uwtick - last_print_tick) >= 100U)
+    {
+        last_print_tick = uwtick;
 
-void balance_apply_servo_center(void)
-{
-    servo_set((uint32_t)(mid + balance_servo_trim));
+        if (!header_printed)
+        {
+            header_printed = 1U;
+            printf("LOG,t,pitch,zero,p,gy,ta,tg,so,pwm,rpm,md,ap,ai,ad,ao,gp,gi,gd,go\r\n");
+        }
+
+        printf("LOG,%lu,%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%lu,%d,%d,%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%0.2f\r\n",
+               (unsigned long)uwtick,
+               pitch,
+               balance_zero_angle,
+               pitch_balance,
+               gyro_y_rate,
+               target_angle,
+               target_gyro_rate,
+               servo_output,
+               (unsigned long)servo_last_duty,
+               motor_rpm,
+               motor_last_duty,
+               angle_pid.p_out,
+               angle_pid.i_out,
+               angle_pid.d_out,
+               angle_pid.out,
+               gyro_pid.p_out,
+               gyro_pid.i_out,
+               gyro_pid.d_out,
+               gyro_pid.out);
+    }
 }

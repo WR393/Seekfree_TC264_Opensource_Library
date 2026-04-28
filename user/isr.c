@@ -39,7 +39,7 @@ IFX_INTERRUPT(cc61_pit_ch1_isr, 0, CCU6_1_CH1_ISR_PRIORITY)
 {
     interrupt_global_enable(0);
     pit_clear_flag(CCU61_CH1);
-    balance_steering_loop(0.0f);
+    balance_steering_loop();
 }
 
 // 外部中断分组:

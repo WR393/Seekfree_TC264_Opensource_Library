@@ -122,6 +122,23 @@ float pid_calculate_incremental(PID_T * _tpPID, float _current)
     return _tpPID->out;
 }
 
+/* PID from caller-provided error, used by angle-wrapped heading control. */
+float pid_calculate_by_error(PID_T * _tpPID, float _error)
+{
+    _tpPID->error = _error;
+    _tpPID->integral += _tpPID->error;
+
+    _tpPID->p_out = _tpPID->kp * _tpPID->error;
+    _tpPID->i_out = _tpPID->ki * _tpPID->integral;
+    _tpPID->d_out = _tpPID->kd * (_tpPID->error - _tpPID->last_error);
+
+    _tpPID->out = _tpPID->p_out + _tpPID->i_out + _tpPID->d_out;
+    _tpPID->last_error = _tpPID->error;
+
+    pid_out_limit(_tpPID);
+    return _tpPID->out;
+}
+
 /* ————————————————————————————————— PID相关的功能函数 ————————————————————————————————— */
 /*******************************************************************************
  * @brief 输出限幅函数

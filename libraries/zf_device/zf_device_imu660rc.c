@@ -225,19 +225,39 @@ static void quarternion_normalize(float quat[4], uint16 *fp16)
 static void quarternion_to_euler(float quat[4], float *roll, float *pitch, float *yaw)
 {
     float euler[3];
+    float asin_value;
 
     float sqx = quat[0] * quat[0];
     float sqy = quat[1] * quat[1];
     float sqz = quat[2] * quat[2];
+
+    asin_value = 2.0f * (quat[0] * quat[3] - quat[1] * quat[2]);
+    if (!(asin_value == asin_value))
+    {
+        return;
+    }
+    if (asin_value > 1.0f)
+    {
+        asin_value = 1.0f;
+    }
+    else if (asin_value < -1.0f)
+    {
+        asin_value = -1.0f;
+    }
     
     euler[0] =  atan2f(2.0f * (quat[1] * quat[3] + quat[0] * quat[2]), 1.0f - 2.0f * (sqy + sqx));
-    euler[1] = -asinf(2.0f * (quat[0] * quat[3] - quat[1] * quat[2]));
+    euler[1] = -asinf(asin_value);
     euler[2] =  atan2f(2.0f * (quat[0] * quat[1] + quat[2] * quat[3]), 1.0f - 2.0f * (sqx + sqz));
     
     // 弧度转角度
     euler[0] = 180 * (euler[0]) / M_PI;
     euler[1] = 180 * (euler[1]) / M_PI;
     euler[2] = 180 * (euler[2]) / M_PI;
+
+    if (!(euler[0] == euler[0]) || !(euler[1] == euler[1]) || !(euler[2] == euler[2]))
+    {
+        return;
+    }
     
     // 角度调整
     euler[2] = 0 > euler[2] ? euler[2] + 360 : euler[2];
@@ -548,10 +568,6 @@ uint8 imu660rc_init(imu660rc_quarternion_rate_config quarternion_rate)
 
     return return_state;
 }
-
-
-
-
 
 
 

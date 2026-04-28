@@ -2,147 +2,111 @@
 
 #pragma section all "cpu0_dsram"
 
-// 当前平衡策略使用的固定巡航速度。
-#define BALANCE_FIXED_SPEED_RPM 800
+// 前台电机限速任务周期，单位：ms。实时平衡环不在主循环中运行。
+#define MAIN_MOTOR_LOOP_PERIOD_MS      (10U)
 
-// 启动阶段先用开环占空比把电机拉起来，再切到闭环速度控制。
-#define BALANCE_STARTUP_DUTY 1200
-#define BALANCE_STARTUP_RPM 80
+// 当前目标为零占空比，只保留斜坡和限速保护框架。
+#define MAIN_MOTOR_TARGET_DUTY         (0)
+#define MAIN_MOTOR_DUTY_STEP           (20)
 
-// 小车只有满足启动条件后，才允许平衡控制接管。
-#define BALANCE_ENABLE_DELAY_MS 1200
-#define BALANCE_ENABLE_MIN_RPM 300
-#define BALANCE_ENABLE_MAX_PITCH_DEG 8.0f
+// 电机转速保护阈值，单位：rpm。
+#define MAIN_MOTOR_RPM_LIMIT           (650)
+#define MAIN_MOTOR_RPM_HARD_LIMIT      (900)
 
-// 调试和校准相关开关。
-#define IMU_LOG_PERIOD_MS 20
-#define IMU_FALL_STOP_PITCH_DEG 35.0f
-#define ENABLE_SERVO_TRIM_CALIBRATION 0
-#define SERVO_TRIM_RUNTIME_STEP 50
-#define SERVO_TRIM_CALIBRATION_WINDOW_MS 3000
-#define SERVO_TRIM_CALIBRATION_STEP_SMALL 10
-#define SERVO_TRIM_CALIBRATION_STEP_LARGE 50
+// 车身倾倒保护阈值，单位：deg。
+#define MAIN_MOTOR_STOP_PITCH_DEG      (35.0f)
 
-static void servo_trim_calibration(void)
+static int16 main_abs_i16(int16 value)
 {
-    uint32 elapsed_ms = 0;
-    int32 trim = balance_get_servo_trim();
-
-    // 按键扫描周期设为 10 ms。
-    key_init(10);
-    key_clear_all_state();
-
-    // 校准开始前，先让前轮回到软件中位。
-    balance_apply_servo_center();
-
-    printf("servo trim calibration start\r\n");
-    printf("KEY1:-10  KEY1 long:-50  KEY2:+10  KEY2 long:+50\r\n");
-    printf("KEY3 reset  KEY4 finish  current_trim:%ld\r\n", (long)trim);
-
-    while (elapsed_ms < SERVO_TRIM_CALIBRATION_WINDOW_MS)
-    {
-        key_scanner();
-
-        if (KEY_SHORT_PRESS == key_get_state(KEY_1))
-        {
-            trim -= SERVO_TRIM_CALIBRATION_STEP_SMALL;
-            key_clear_state(KEY_1);
-        }
-        else if (KEY_LONG_PRESS == key_get_state(KEY_1))
-        {
-            trim -= SERVO_TRIM_CALIBRATION_STEP_LARGE;
-            key_clear_state(KEY_1);
-        }
-        else if (KEY_SHORT_PRESS == key_get_state(KEY_2))
-        {
-            trim += SERVO_TRIM_CALIBRATION_STEP_SMALL;
-            key_clear_state(KEY_2);
-        }
-        else if (KEY_LONG_PRESS == key_get_state(KEY_2))
-        {
-            trim += SERVO_TRIM_CALIBRATION_STEP_LARGE;
-            key_clear_state(KEY_2);
-        }
-        else if ((KEY_SHORT_PRESS == key_get_state(KEY_3)) ||
-                 (KEY_LONG_PRESS == key_get_state(KEY_3)))
-        {
-            trim = 0;
-            key_clear_state(KEY_3);
-        }
-        else if ((KEY_SHORT_PRESS == key_get_state(KEY_4)) ||
-                 (KEY_LONG_PRESS == key_get_state(KEY_4)))
-        {
-            key_clear_state(KEY_4);
-            break;
-        }
-        else
-        {
-            system_delay_ms(10);
-            elapsed_ms += 10;
-            continue;
-        }
-
-        balance_set_servo_trim(trim);
-        balance_apply_servo_center();
-        printf("servo trim:%ld center_pwm:%ld\r\n", (long)trim, (long)(mid + trim));
-
-        // 每次调完都重新开始计时，避免还没调完就自动退出。
-        elapsed_ms = 0;
-        system_delay_ms(10);
-    }
-
-    printf("servo trim calibration done: %ld\r\n", (long)balance_get_servo_trim());
+    // 本文件内部使用的 int16 绝对值，避免引入额外库函数。
+    return (value >= 0) ? value : (int16)(-value);
 }
 
-static void handle_servo_trim_keys(void)
+static float main_abs_f32(float value)
 {
-    int32 trim = balance_get_servo_trim();
+    // 本文件内部使用的 float 绝对值。
+    return (value >= 0.0f) ? value : -value;
+}
 
-    key_scanner();
+static void main_motor_limit_loop(void)
+{
+    // 主循环里的低频电机保护任务：读取转速和倾角，平滑更新占空比。
+    static uint32 last_run_tick = 0U;
+    static int16 current_duty = 0;
+    int16 target_duty = MAIN_MOTOR_TARGET_DUTY;
+    int16 abs_rpm = 0;
+    float abs_pitch = 0.0f;
 
-    // 运行时中位微调：
-    // 当小车“基本能平衡，但前轮还不够正”时，用这个更方便。
-    if (KEY_SHORT_PRESS == key_get_state(KEY_1))
+    if ((uwtick - last_run_tick) < MAIN_MOTOR_LOOP_PERIOD_MS)
     {
-        trim -= SERVO_TRIM_RUNTIME_STEP;
-        balance_set_servo_trim(trim);
-        key_clear_state(KEY_1);
-        printf("servo trim:%ld\r\n", (long)trim);
+        // 未到周期直接返回，主循环仍可继续执行其他前台任务。
+        return;
     }
-    else if (KEY_SHORT_PRESS == key_get_state(KEY_2))
+    last_run_tick = uwtick;
+
+    motor_get_speed();
+    abs_rpm = main_abs_i16(motor_rpm);
+    abs_pitch = main_abs_f32(pitch_balance);
+
+    if ((abs_pitch > MAIN_MOTOR_STOP_PITCH_DEG) || (abs_rpm > MAIN_MOTOR_RPM_HARD_LIMIT))
     {
-        trim += SERVO_TRIM_RUNTIME_STEP;
-        balance_set_servo_trim(trim);
-        key_clear_state(KEY_2);
-        printf("servo trim:%ld\r\n", (long)trim);
+        // 大角度倾倒或严重超速时立即把目标占空比拉回 0。
+        target_duty = 0;
     }
+    else if (abs_rpm > MAIN_MOTOR_RPM_LIMIT)
+    {
+        target_duty = 0;
+    }
+    else if (abs_rpm > (MAIN_MOTOR_RPM_LIMIT - 100))
+    {
+        target_duty = MAIN_MOTOR_TARGET_DUTY / 2;
+    }
+
+    if (current_duty < target_duty)
+    {
+        // 斜坡限制占空比变化，避免电机命令阶跃。
+        current_duty += MAIN_MOTOR_DUTY_STEP;
+        if (current_duty > target_duty)
+        {
+            current_duty = target_duty;
+        }
+    }
+    else if (current_duty > target_duty)
+    {
+        current_duty -= MAIN_MOTOR_DUTY_STEP;
+        if (current_duty < target_duty)
+        {
+            current_duty = target_duty;
+        }
+    }
+
+    motor_set_duty(current_duty);
 }
 
 int core0_main(void)
 {
-    // 板级时钟和调试串口初始化。
+    // CPU0 负责板级初始化、应用层初始化、PIT 节拍和前台调度。
     clock_init();
     debug_init();
 
-    // 初始化舵机 PWM 输出。
+    // 舵机 PWM 先初始化到中位，再做一次上电自检。
     pwm_init(ATOM1_CH1_P33_9, 330, mid);
+    servo_startup_self_test();
 
-    // 先把平衡控制内部状态清零，再初始化电机和 IMU。
-    balance_init();
-
-#if ENABLE_SERVO_TRIM_CALIBRATION
-    servo_trim_calibration();
-#endif
-
-    key_init(10);
+    // 设备和应用层初始化顺序：电机 -> IMU -> 平衡控制 -> 前台调度。
     motor_init();
+    system_delay_ms(500);
     imu_all_init();
+    balance_init();
+    scheduler_init();
 
-    // 周期任务分配：
-    // 1 ms  -> 系统时基
-    // 2 ms  -> IMU 更新 + 角速度环
-    // 10 ms -> 角度环
-    // 20 ms -> 转向环
+    motor_set_duty(0);
+
+    // PIT 周期分配：
+    // 1ms  系统时基 uwtick
+    // 2ms  IMU 更新 + 角速度内环
+    // 10ms 角度环
+    // 20ms 航向外环
     pit_ms_init(CCU60_CH0, 1);
     pit_ms_init(CCU60_CH1, 2);
     pit_ms_init(CCU61_CH0, 10);
@@ -152,52 +116,9 @@ int core0_main(void)
 
     while (TRUE)
     {
-        int16 abs_rpm = (motor_rpm >= 0) ? motor_rpm : (int16)(-motor_rpm);
-        float abs_pitch = (pitch >= 0.0f) ? pitch : -pitch;
-
-        // 一旦平衡接管成功，本次上电周期内就一直保持使能。
-        static uint8 balance_armed = 0;
-
-        handle_servo_trim_keys();
-
-        // 启动阶段：
-        // 先强行拉起电机转动，再切到固定速度控制。
-        if (abs_rpm < BALANCE_STARTUP_RPM)
-        {
-            motor_set_duty(BALANCE_STARTUP_DUTY);
-        }
-        else
-        {
-            motor_set_speed(BALANCE_FIXED_SPEED_RPM);
-        }
-
-        // 每次主循环都刷新一次速度反馈。
-        motor_get_speed();
-
-        // 平衡接管条件：
-        // 1. 上电已经过了一段时间
-        // 2. 电机速度已经起来
-        // 3. 当前车身姿态没有大角度倾倒
-        // 这样可以避免刚上电时舵机猛打。
-        if (!balance_armed)
-        {
-            if ((uwtick >= BALANCE_ENABLE_DELAY_MS) &&
-                (abs_rpm >= BALANCE_ENABLE_MIN_RPM) &&
-                (abs_pitch <= BALANCE_ENABLE_MAX_PITCH_DEG))
-            {
-                balance_set_enabled(1);
-                balance_armed = 1;
-                printf("balance armed yaw:%0.3f trim:%ld\r\n",
-                       yaw,
-                       (long)balance_get_servo_trim());
-            }
-            else
-            {
-                balance_set_enabled(0);
-            }
-        }
-
-        system_delay_ms(10);
+        // 主循环只处理可延后的保护、日志和显示任务。
+        main_motor_limit_loop();
+        scheduler_run();
     }
 }
 
