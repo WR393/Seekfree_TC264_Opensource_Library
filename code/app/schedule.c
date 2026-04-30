@@ -7,7 +7,10 @@
 
 #include "scheduler.h"
 #include "balance_app.h"
+#include "imu_app.h"
 #include "motor_app.h"
+#include "servo_app.h"
+#include "justfloat.h"
 
 uint8_t task_num;
 uint32_t uwtick = 0;
@@ -19,10 +22,25 @@ typedef struct
     uint32_t last_run;
 } task_t;
 
+static void vofa_balance_task(void)
+{
+    // VOFA+ FireWater channels:
+    // ch1 pitch, ch2 zero, ch3 pitch error, ch4 gyro_y, ch5 target gyro,
+    // ch6 servo output, ch7 servo pwm, ch8 motor rpm.
+    JustFloat_Test_eight(pitch,
+                         balance_zero_angle,
+                         pitch_balance,
+                         gyro_y_rate,
+                         target_gyro_rate,
+                         servo_output,
+                         (float)servo_last_duty,
+                         (float)motor_rpm);
+}
+
 // 联调时按需打开任务；不要把高频闭环控制放到前台调度器。
 static task_t scheduler_task[] =
 {
-    {pid_test, 10, 0},
+    {vofa_balance_task, 20, 0},
 };
 
 void scheduler_init(void)

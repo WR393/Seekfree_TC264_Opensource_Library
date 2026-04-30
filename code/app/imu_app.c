@@ -160,7 +160,7 @@ void imu_proc(void)
 
     // 驱动层原始陀螺值转换为 deg/s，并扣掉上电静止零偏。
     gyro_x_rate = imu660rc_gyro_transition(imu660rc_gyro_x) - gyro_x_offset;
-    gyro_y_rate = imu660rc_gyro_transition(imu660rc_gyro_y) - gyro_y_offset;
+    gyro_y_rate = -(imu660rc_gyro_transition(imu660rc_gyro_y) - gyro_y_offset);
 
     acc_pitch = imu_pitch_from_acc();
     if (!pitch_filter_ready)

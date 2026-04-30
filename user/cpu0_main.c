@@ -1,4 +1,5 @@
 #include "zf_common_headfile.h"
+#include "justfloat.h"
 
 #pragma section all "cpu0_dsram"
 
@@ -6,7 +7,7 @@
 #define MAIN_MOTOR_LOOP_PERIOD_MS      (10U)
 
 // 当前目标为零占空比，只保留斜坡和限速保护框架。
-#define MAIN_MOTOR_TARGET_DUTY         (0)
+#define MAIN_MOTOR_TARGET_DUTY         (600)
 #define MAIN_MOTOR_DUTY_STEP           (20)
 
 // 电机转速保护阈值，单位：rpm。
@@ -88,6 +89,7 @@ int core0_main(void)
     // CPU0 负责板级初始化、应用层初始化、PIT 节拍和前台调度。
     clock_init();
     debug_init();
+    justfloat_init();
 
     // 舵机 PWM 先初始化到中位，再做一次上电自检。
     pwm_init(ATOM1_CH1_P33_9, 330, mid);

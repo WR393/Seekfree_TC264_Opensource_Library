@@ -58,8 +58,8 @@ void balance_init(void)
 
     // PID 输出限幅直接对应下一级目标或舵机修正量，调参时先确认执行周期。
     pid_init(&steering_pid, 0.2f, 0.0f, 0.2f, 0.0f, 15.0f);
-    pid_init(&angle_pid, 10.0f, 0.0f, 0.0f, 0.0f, 300.0f);
-    pid_init(&gyro_pid, 1.1f, 0.0f, 0.0f, 0.0f, 650.0f);
+    pid_init(&angle_pid,100.0f, 0.8f, 0.3f, 0.0f, 400.0f);
+    pid_init(&gyro_pid, 2.0f, 0.0f, 0.0f, 0.0f, 1600.0f);
     pid_app_limit_integral(&angle_pid, -200.0f, 200.0f);
 
     servo_set(mid);
